@@ -337,24 +337,8 @@ def main(args):
         use_autoaugment=args.use_autoaugment,
     )
 
-    # Validate augmentation and model before training
     print("\n" + "=" * 70)
-    print("STEP 1: Validating augmentation and model...")
-    print("=" * 70)
-    temp_model = EmbeddingModel(
-        model_name="resnet50",
-        embedding_dim=args.embedding_dim,
-        pretrained=True,
-    )
-    if not validate_model_and_augmentation(temp_model, dataset, num_samples=4, device=device):
-        print("\n❌ Validation failed. Exiting.")
-        if args.use_wandb:
-            wandb.finish()
-        return
-    del temp_model
-
-    print("\n" + "=" * 70)
-    print("STEP 2: Preparing train/val split...")
+    print("STEP 1: Preparing train/val split...")
     print("=" * 70)
     # Split into train/val
     train_ds, val_ds = train_val_split(
@@ -430,7 +414,7 @@ def main(args):
 
     # Model, loss, optimizer
     print("\n" + "=" * 70)
-    print("STEP 3: Initializing embedding model...")
+    print("STEP 2: Initializing embedding model...")
     print("=" * 70)
     model = EmbeddingModel(
         model_name="resnet50",
@@ -455,12 +439,12 @@ def main(args):
 
     # This visualization is for triplets, so we'll skip it for SupCon
     print("\n" + "=" * 70)
-    print("STEP 4A: Skipping triplet visualization (using SupConLoss)...")
+    print("STEP 3A: Skipping triplet visualization (using SupConLoss)...")
     print("=" * 70)
 
     # Training loop
     print("\n" + "=" * 70)
-    print("STEP 4B: Starting training...")
+    print("STEP 3B: Starting training...")
     print("=" * 70)
     best_accuracy = 0.0
 
@@ -507,7 +491,7 @@ def main(args):
             print(f"Saved best model to {model_path}")
 
     print("\n" + "=" * 70)
-    print("STEP 5: Starting linear classifier training...")
+    print("STEP 4: Starting linear classifier training...")
     print("=" * 70)
     
     # Load the best embedding model
@@ -592,7 +576,7 @@ def main(args):
 
     # Final test evaluation
     print("\n" + "=" * 70)
-    print("STEP 6: Final evaluation on test set...")
+    print("STEP 5: Final evaluation on test set...")
     print("=" * 70)
     test_metrics = final_eval(
         model, test_loader, device=device, metric=args.metric
