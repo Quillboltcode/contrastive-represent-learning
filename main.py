@@ -127,12 +127,15 @@ class RAFDBWithAugmentation(Dataset):
             img_augmented = [
                 aug_transform(img) for aug_transform in self.augmentation_transforms
             ]
-            # Stack all views
-            all_views = torch.stack(img_augmented, dim=0)
+            if len(img_augmented) > 1:
+                # Stack all views for contrastive learning
+                all_views = torch.stack(img_augmented, dim=0)
+            else:
+                # Return a single 4D tensor for standard classification training
+                all_views = img_augmented[0]
         else:
             # For validation/test, just apply the base transform
-            # To keep the collate function happy, we return it as a "single view"
-            all_views = self.base_transform(img).unsqueeze(0)
+            all_views = self.base_transform(img)
 
         return all_views, label
 
@@ -514,14 +517,12 @@ def main(args):
     
     # Create a new dataset instance for the classifier training phase
     # where we don't need multiple augmentations per sample.
-    clf_train_dataset = RAFDBWithAugmentation(root=args.rafdb_root, split="train", num_augmentations=1)
-    clf_train_ds = torch.utils.data.Subset(clf_train_dataset, train_ds.indices)
-    
-    clf_val_dataset = RAFDBWithAugmentation(root=args.rafdb_root, split="train", num_augmentations=1)
-    clf_val_ds = torch.utils.data.Subset(clf_val_dataset, val_ds.indices)
+    # We can reuse the original subsets, but need new DataLoaders without the special collate_fn
+    # The dataset's __getitem__ will now return a 4D tensor directly.
+    train_ds.dataset.num_augmentations = 1 # Use only one "augmentation" (the base transform)
 
-    clf_train_loader = DataLoader(clf_train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    clf_val_loader = DataLoader(clf_val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    clf_train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    clf_val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     clf_loss_fn = nn.CrossEntropyLoss()
     clf_optimizer = optim.Adam(classifier_model.classifier.parameters(), lr=args.lr)
@@ -542,7 +543,7 @@ def main(args):
         all_preds, all_labels = [], []
         with torch.no_grad():
             for images, labels in clf_val_loader:
-                images, labels = images.squeeze(1).to(device), labels.to(device) # Squeeze the view dimension
+                images, labels = images.to(device), labels.to(device)
                 outputs = classifier_model(images)
                 _, preds = torch.max(outputs, 1)
                 all_preds.extend(preds.cpu().numpy())
@@ -638,7 +639,7 @@ if __name__ == "__main__":
     # Training args
     parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--num_epochs_classifier", type=int, default=20, help="Number of epochs for linear classifier")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=28, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lr_step", type=int, default=10, help="LR scheduler step")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers")
