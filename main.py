@@ -334,7 +334,7 @@ def train_combined_epoch(
         loss_ce = loss_ce_fn(logits, labels)
 
         # 3. Combined Loss
-        loss = alpha * loss_metric + (1.0 - alpha) * loss_ce
+        loss = alpha * loss_metric +  loss_ce
 
         optimizer.zero_grad()
         loss.backward()
