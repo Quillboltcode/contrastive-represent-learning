@@ -38,7 +38,11 @@ def compute_embeddings(
             inputs = inputs.to(device)
             labels = labels.to(device)
 
-            embeddings = model(inputs)
+            outputs = model(inputs)
+            if isinstance(outputs, tuple):
+                embeddings = outputs[0]
+            else:
+                embeddings = outputs
             all_embeddings.append(embeddings.cpu())
             all_labels.append(labels.cpu())
 

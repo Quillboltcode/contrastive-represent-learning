@@ -535,10 +535,10 @@ def main(args):
         print(f"  - Metric Loss: SupConLoss (temp={args.temperature})")
         criterion_metric = SupConLoss(temperature=args.temperature)
     else:
-        print("  - Metric Loss: TripletMarginLoss (margin=0.2)")
-        criterion_metric = TripletMarginLoss(margin=0.2)
+        print(f"  - Metric Loss: TripletMarginLoss (margin={args.margin})")
+        criterion_metric = TripletMarginLoss(margin=args.margin)
         print("  - Miner: TripletMarginMiner")
-        miner = TripletMarginMiner(margin=0.2, type_of_triplets="semihard")
+        miner = TripletMarginMiner(margin=args.margin, type_of_triplets="semihard")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(
@@ -696,6 +696,7 @@ if __name__ == "__main__":
 
     # Metric learning args
     parser.add_argument("--temperature", type=float, default=0.1, help="SupCon temperature")
+    parser.add_argument("--margin", type=float, default=0.2, help="Triplet margin")
     parser.add_argument(
         "--metric",
         type=str,
