@@ -12,7 +12,9 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms, models
 
 import wandb
-from pytorch_metric_learning.losses import SupConLoss
+from tqdm import tqdm
+from pytorch_metric_learning.losses import SupConLoss, TripletMarginLoss
+from pytorch_metric_learning.miners import TripletMarginMiner
 from pytorch_metric_learning.samplers import MPerClassSampler
 
 from dataset import train_val_split
@@ -122,17 +124,14 @@ class RAFDBWithAugmentation(Dataset):
         # Get original image and label
         img, label = self.dataset[idx]
         
-        if self.split == 'train':
+        if self.split == 'train' or self.num_augmentations > 0:
             # For training, create multiple augmented views for contrastive learning
             img_augmented = [
                 aug_transform(img) for aug_transform in self.augmentation_transforms
             ]
-            if len(img_augmented) > 1:
-                # Stack all views for contrastive learning
-                all_views = torch.stack(img_augmented, dim=0)
-            else:
-                # Return a single 4D tensor for standard classification training
-                all_views = img_augmented[0]
+            
+            # Stack all views: (num_augmentations, 3, 224, 224)
+            all_views = torch.stack(img_augmented, dim=0)
         else:
             # For validation/test, just apply the base transform
             all_views = self.base_transform(img)
@@ -262,6 +261,68 @@ def visualize_triplet_mining(
     print("=" * 70)
 
 
+def train_combined_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    loss_metric_fn: nn.Module,
+    loss_ce_fn: nn.Module,
+    alpha: float,
+    device: torch.device,
+    miner=None,
+    epoch: int = 0,
+    log_interval: int = 10,
+) -> dict:
+    """Train one epoch with combined Metric and Cross-Entropy loss."""
+    model.train()
+    total_loss = 0.0
+    total_metric_loss = 0.0
+    total_ce_loss = 0.0
+    num_batches = 0
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=True)
+
+    for batch_idx, (images, labels) in enumerate(pbar):
+        images, labels = images.to(device), labels.to(device)
+
+        # Forward pass: get embeddings and logits
+        embeddings, logits = model(images)
+
+        # 1. Metric Learning Loss
+        if miner is not None:
+            indices_tuple = miner(embeddings, labels)
+            loss_metric = loss_metric_fn(embeddings, labels, indices_tuple)
+        else:
+            loss_metric = loss_metric_fn(embeddings, labels)
+
+        # 2. Cross-Entropy Loss
+        loss_ce = loss_ce_fn(logits, labels)
+
+        # 3. Combined Loss
+        loss = alpha * loss_metric + (1.0 - alpha) * loss_ce
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_metric_loss += loss_metric.item()
+        total_ce_loss += loss_ce.item()
+        num_batches += 1
+
+        if (batch_idx + 1) % log_interval == 0:
+            pbar.set_postfix({
+                "L_tot": f"{total_loss/num_batches:.3f}",
+                "L_met": f"{total_metric_loss/num_batches:.3f}",
+                "L_ce": f"{total_ce_loss/num_batches:.3f}"
+            })
+
+    return {
+        "total": total_loss / num_batches if num_batches > 0 else 0.0,
+        "metric": total_metric_loss / num_batches if num_batches > 0 else 0.0,
+        "ce": total_ce_loss / num_batches if num_batches > 0 else 0.0,
+    }
+
 def collate_fn_with_augmentations(batch):
     """Custom collate to handle augmented views.
 
@@ -275,10 +336,15 @@ def collate_fn_with_augmentations(batch):
 
     for views, label in batch:
         # Flatten augmentations for this sample
-        # views shape: (num_aug+1, 3, 224, 224)
-        num_views = views.shape[0]
-        for v in range(num_views):
-            views_list.append(views[v])
+        # views can be (num_aug, 3, 224, 224) or just (3, 224, 224)
+        if views.dim() == 4:
+            num_views = views.shape[0]
+            for v in range(num_views):
+                views_list.append(views[v])
+                labels_list.append(label)
+        else:
+            # Single view (3, 224, 224)
+            views_list.append(views)
             labels_list.append(label)
 
     images = torch.stack(views_list, dim=0)
@@ -301,6 +367,17 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    if args.debug:
+        print("\n!!! DEBUG MODE ENABLED !!!")
+        print("Overriding num_epochs to 2")
+        args.num_epochs = 2
+
+    print("\n" + "=" * 70)
+    print("HYPERPARAMETERS")
+    print("=" * 70)
+    for key, value in vars(args).items():
+        print(f"{key}: {value}")
+
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +395,9 @@ def main(args):
         "grayscale_prob": args.grayscale_prob,
         "use_autoaugment": args.use_autoaugment,
         "m_per_class": args.m_per_class,
+        "loss_type": args.loss_type,
+        "alpha": args.alpha,
+        "use_gating": args.use_gating,
     }
     if args.use_wandb:
         setup_wandb(config)
@@ -330,27 +410,37 @@ def main(args):
     print(f"  Rotation: ±{args.rotation_degrees}°")
     print(f"  Grayscale prob: {args.grayscale_prob}")
     print(f"  Using AutoAugment: {args.use_autoaugment}")
-    dataset = RAFDBWithAugmentation(
+    
+    # We need to manually split indices to create proper Train (augmented) and Val (clean) sets
+    # First, create a dummy dataset to get the split indices
+    temp_dataset = datasets.ImageFolder(str(Path(args.rafdb_root) / "train"))
+    train_subset, val_subset = train_val_split(
+        temp_dataset, val_fraction=args.val_fraction, seed=args.seed
+    )
+    train_indices = train_subset.indices
+    val_indices = val_subset.indices
+
+    # Create the actual Train dataset with augmentations
+    train_ds_full = RAFDBWithAugmentation(
         root=args.rafdb_root,
         split="train",
         num_augmentations=args.num_augmentations,
         crop_scale=tuple(args.crop_scale),
         rotation_degrees=args.rotation_degrees,
         grayscale_prob=args.grayscale_prob,
-        use_autoaugment=args.use_autoaugment,
+        use_autoaugment=args.use_autoaugment,    
     )
+    train_ds = torch.utils.data.Subset(train_ds_full, train_indices)
 
-    print("\n" + "=" * 70)
-    print("STEP 1: Preparing train/val split...")
-    print("=" * 70)
-    # Split into train/val
-    train_ds, val_ds = train_val_split(
-        dataset, val_fraction=args.val_fraction, seed=args.seed
+    # Create the actual Val dataset (clean, single view)
+    # We use split='train' to point to the folder, but num_augmentations=1 for single view
+    val_ds_full = RAFDBWithAugmentation(
+        root=args.rafdb_root, split="train", num_augmentations=1
     )
+    val_ds = torch.utils.data.Subset(val_ds_full, val_indices)
 
     # Create samplers
-    # For training: use MPerClassSampler to get balanced batches
-    train_labels = torch.tensor([dataset.dataset.targets[i] for i in train_ds.indices])
+    train_labels = torch.tensor([temp_dataset.targets[i] for i in train_indices])
     num_classes = len(torch.unique(train_labels))
     max_batch_size = args.m_per_class * num_classes
 
@@ -419,21 +509,36 @@ def main(args):
     print("\n" + "=" * 70)
     print("STEP 2: Initializing embedding model...")
     print("=" * 70)
+    
     model = EmbeddingModel(
         model_name="resnet50",
         embedding_dim=args.embedding_dim,
         pretrained=True,
         normalize=True,
+        num_classes=num_classes,  # Enable classifier head
+        use_gating=args.use_gating,
     )
     model.to(device)
     print("✓ Model initialized:")
     print("  - Backbone: ResNet50 (pretrained)")
     print(f"  - Embedding dim: {args.embedding_dim}")
     print("  - Normalization: Enabled (L2)")
+    print(f"  - One-Stage Learning: True (alpha={args.alpha})")
     print(f"  - Device: {device}")
     print(f"  - Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    loss_fn = SupConLoss(temperature=args.temperature)
+    # Loss setup
+    criterion_ce = nn.CrossEntropyLoss()
+    
+    miner = None
+    if args.loss_type == "supcon":
+        print(f"  - Metric Loss: SupConLoss (temp={args.temperature})")
+        criterion_metric = SupConLoss(temperature=args.temperature)
+    else:
+        print("  - Metric Loss: TripletMarginLoss (margin=0.2)")
+        criterion_metric = TripletMarginLoss(margin=0.2)
+        print("  - Miner: TripletMarginMiner")
+        miner = TripletMarginMiner(margin=0.2, type_of_triplets="semihard")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(
@@ -441,27 +546,33 @@ def main(args):
     )
 
     # This visualization is for triplets, so we'll skip it for SupCon
-    print("\n" + "=" * 70)
-    print("STEP 3A: Skipping triplet visualization (using SupConLoss)...")
-    print("=" * 70)
+    if miner is not None:
+        visualize_triplet_mining(model, train_loader, miner, device)
+    else:
+        print("\n" + "=" * 70)
+        print("STEP 3A: Skipping triplet visualization (using SupConLoss)...")
+        print("=" * 70)
 
     # Training loop
     print("\n" + "=" * 70)
-    print("STEP 3B: Starting training...")
+    print("STEP 3B: Starting one-stage training...")
     print("=" * 70)
     best_accuracy = 0.0
 
     for epoch in range(args.num_epochs):
         # Train
-        train_loss = train_one_epoch(
+        train_results = train_combined_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
-            loss_fn=loss_fn,
+            loss_metric_fn=criterion_metric,
+            loss_ce_fn=criterion_ce,
+            alpha=args.alpha,
             device=device,
-            miner=None, # No miner for SupConLoss
+            miner=miner,
             epoch=epoch,
         )
+        train_loss = train_results["total"]
 
         # Validate
         val_metrics = evaluate_one_epoch(
@@ -475,7 +586,11 @@ def main(args):
 
         # Log to wandb
         if args.use_wandb:
-            log_dict = {"train_loss": train_loss}
+            log_dict = {
+                "train_loss": train_loss,
+                "train_loss_metric": train_results["metric"],
+                "train_loss_ce": train_results["ce"],
+            }
             log_dict.update(val_metrics)
             log_dict["learning_rate"] = scheduler.get_last_lr()[0]
             wandb.log(log_dict, step=epoch)
@@ -492,76 +607,6 @@ def main(args):
             model_path = output_dir / "best_model.pth"
             torch.save(model.state_dict(), model_path)
             print(f"Saved best model to {model_path}")
-
-    print("\n" + "=" * 70)
-    print("STEP 4: Starting linear classifier training...")
-    print("=" * 70)
-    
-    # Load the best embedding model
-    best_model_path = output_dir / "best_model.pth"
-    if best_model_path.exists():
-        print(f"Loading best embedding model from {best_model_path}")
-        embedding_model = EmbeddingModel(embedding_dim=args.embedding_dim, pretrained=False)
-        embedding_model.load_state_dict(torch.load(best_model_path))
-        embedding_model.to(device)
-    else:
-        print("No best model found, using the model from the last epoch.")
-        embedding_model = model
-
-    # Create the linear classifier model
-    classifier_model = LinearClassifier(embedding_model, num_classes=num_classes).to(device)
-    
-    # Create new dataloaders for classifier training (no special sampler or collate_fn needed)
-    # We can reuse the train_ds and val_ds splits
-    # The dataset will now only return one view (the base transform)
-    
-    # Create a new dataset instance for the classifier training phase
-    # where we don't need multiple augmentations per sample.
-    # We can reuse the original subsets, but need new DataLoaders without the special collate_fn
-    # The dataset's __getitem__ will now return a 4D tensor directly.
-    train_ds.dataset.num_augmentations = 1 # Use only one "augmentation" (the base transform)
-
-    clf_train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    clf_val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-    clf_loss_fn = nn.CrossEntropyLoss()
-    clf_optimizer = optim.Adam(classifier_model.classifier.parameters(), lr=args.lr)
-    
-    best_clf_accuracy = 0.0
-    for epoch in range(args.num_epochs_classifier):
-        train_loss = train_classifier_one_epoch(
-            model=classifier_model,
-            train_loader=clf_train_loader,
-            optimizer=clf_optimizer,
-            loss_fn=clf_loss_fn,
-            device=device,
-            epoch=epoch,
-        )
-        
-        # Evaluate classifier
-        classifier_model.eval()
-        all_preds, all_labels = [], []
-        with torch.no_grad():
-            for images, labels in clf_val_loader:
-                images, labels = images.to(device), labels.to(device)
-                outputs = classifier_model(images)
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        clf_accuracy = (torch.tensor(all_preds) == torch.tensor(all_labels)).float().mean().item()
-        
-        print(f"Classifier Epoch {epoch+1}/{args.num_epochs_classifier} | Loss: {train_loss:.4f} | Val Accuracy: {clf_accuracy:.4f}")
-
-        if args.use_wandb:
-            wandb.log({"clf_train_loss": train_loss, "clf_val_accuracy": clf_accuracy}, step=args.num_epochs + epoch)
-
-        if clf_accuracy > best_clf_accuracy:
-            best_clf_accuracy = clf_accuracy
-            clf_model_path = output_dir / "best_classifier_model.pth"
-            torch.save(classifier_model.state_dict(), clf_model_path)
-            print(f"Saved best classifier model to {clf_model_path}")
-
 
     # Final evaluation and visualization
     print("Final evaluation and visualization...")
@@ -661,6 +706,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--m_per_class", type=int, default=4, help="Samples per class in batch"
     )
+    parser.add_argument(
+        "--loss_type", type=str, default="supcon", choices=["supcon", "triplet"], help="Type of metric loss"
+    )
+    parser.add_argument("--alpha", type=float, default=0.5, help="Weight for metric loss (1-alpha for CE)")
+    parser.add_argument("--use_gating", action="store_true", help="Use gating mechanism in model")
+
 
     # Logging/output args
     parser.add_argument(
@@ -669,6 +720,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", type=str, default="./outputs", help="Output directory"
     )
+    parser.add_argument("--debug", action="store_true", help="Run in debug mode (2 epochs)")
 
     args = parser.parse_args()
     main(args)

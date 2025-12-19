@@ -48,6 +48,11 @@ class EmbeddingModel(nn.Module):
        - Balances computational efficiency with expressiveness
        - 128-dim is standard in metric learning literature
        - Reduces storage and distance computation cost vs higher dims
+
+    5. **One-Stage Learning (Optional)**:
+       - Can optionally add a parallel classifier head for combined
+         Cross-Entropy and Contrastive learning.
+       - Supports gating mechanism to weight features for each head.
     """
 
     def __init__(
@@ -56,6 +61,8 @@ class EmbeddingModel(nn.Module):
         embedding_dim: int = 128,
         pretrained: bool = True,
         normalize: bool = True,
+        num_classes: int = 0,
+        use_gating: bool = False,
     ):
         """Initialize embedding model.
 
@@ -64,10 +71,14 @@ class EmbeddingModel(nn.Module):
             embedding_dim: output embedding dimension.
             pretrained: use ImageNet pre-trained backbone.
             normalize: whether to L2-normalize embeddings.
+            num_classes: if > 0, adds a parallel classifier head.
+            use_gating: if True, adds gating mechanism for feature weighting.
         """
         super().__init__()
         self.embedding_dim = embedding_dim
         self.normalize = normalize
+        self.num_classes = num_classes
+        self.use_gating = use_gating
 
         # Load backbone using timm
         self.backbone = timm.create_model(
@@ -78,14 +89,30 @@ class EmbeddingModel(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 224, 224)
             features = self.backbone(dummy)
-            backbone_dim = features.shape[1]
+            self.backbone_dim = features.shape[1]
 
         # Projection head
         self.projection_head = nn.Sequential(
-            nn.Linear(backbone_dim, 512),
+            nn.Linear(self.backbone_dim, 512),
             nn.ReLU(),
             nn.Linear(512, embedding_dim),
         )
+
+        # Optional: Classifier Head
+        if self.num_classes > 0:
+            self.classifier_head = nn.Linear(self.backbone_dim, num_classes)
+
+        # Optional: Gating Mechanism
+        if self.use_gating:
+            self.gate_projection = nn.Sequential(
+                nn.Linear(self.backbone_dim, self.backbone_dim),
+                nn.Sigmoid()
+            )
+            if self.num_classes > 0:
+                self.gate_classifier = nn.Sequential(
+                    nn.Linear(self.backbone_dim, self.backbone_dim),
+                    nn.Sigmoid()
+                )
 
     def freeze_backbone(self):
         """Freeze all parameters in the backbone."""
@@ -95,24 +122,38 @@ class EmbeddingModel(nn.Module):
         # for param in self.projection_head[0].parameters():
         #     param.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         """Compute embeddings for input images.
 
         Args:
             x: input tensor of shape (B, 3, 224, 224).
 
         Returns:
-            embeddings of shape (B, embedding_dim).
+            If num_classes=0: embeddings of shape (B, embedding_dim).
+            If num_classes>0: tuple (embeddings, logits).
         """
         # Backbone: (B, 3, 224, 224) -> (B, backbone_dim)
         features = self.backbone(x)
 
+        # Apply gating if enabled
+        features_proj = features
+        features_class = features
+
+        if self.use_gating:
+            features_proj = features * self.gate_projection(features)
+            if self.num_classes > 0:
+                features_class = features * self.gate_classifier(features)
+
         # Projection head: (B, backbone_dim) -> (B, embedding_dim)
-        embeddings = self.projection_head(features)
+        embeddings = self.projection_head(features_proj)
 
         # L2 normalization for cosine similarity
         if self.normalize:
             embeddings = nn.functional.normalize(embeddings, p=2, dim=1)
+
+        if self.num_classes > 0:
+            logits = self.classifier_head(features_class)
+            return embeddings, logits
 
         return embeddings
 
