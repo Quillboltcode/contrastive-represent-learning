@@ -179,16 +179,10 @@ def evaluate_one_epoch(
     # Compute embeddings for all validation samples
     embeddings, labels = compute_embeddings(model, val_loader, device)
 
-    # Compute Recall@K using all validation samples as both query and gallery
-    recall_at_k = compute_recall_at_k(
-        embeddings, labels, embeddings, labels, k_values=k_values, metric=metric
-    )
-
     # Compute accuracy (nearest neighbor classification)
     accuracy = compute_accuracy(embeddings, labels, metric=metric)
 
-    # Format results as dict with string keys
-    results = {f"recall_at_{k}": v for k, v in recall_at_k.items()}
+    results = {}
     results["accuracy"] = accuracy
 
     return results
@@ -216,15 +210,10 @@ def final_eval(
     # Compute embeddings for all test samples
     embeddings, labels = compute_embeddings(model, test_loader, device)
 
-    # Compute standard Recall@K metrics
-    recall_at_k = compute_recall_at_k(
-        embeddings, labels, embeddings, labels, k_values=[1, 5, 10], metric=metric
-    )
-
     # Compute accuracy (nearest neighbor classification)
     accuracy = compute_accuracy(embeddings, labels, metric=metric)
 
-    results = {f"recall_at_{k}": v for k, v in recall_at_k.items()}
+    results = {}
     results["accuracy"] = accuracy
 
     # Additional statistics

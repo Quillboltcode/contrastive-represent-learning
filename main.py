@@ -23,6 +23,7 @@ from evalute import evaluate_one_epoch, final_eval
 from visualize import (
     compute_embeddings_and_predictions,
     compute_confusion_matrix,
+    compute_confusion_matrix_from_logits,
     compute_classification_report,
     visualize_confusion_matrix,
     visualize_pca,
@@ -46,6 +47,7 @@ class RAFDBWithAugmentation(Dataset):
         rotation_degrees: int = 15,
         grayscale_prob: float = 0.3,
         use_autoaugment: bool = False,
+        aggressive_aug: bool = False,
     ):
         """Initialize RAFDB dataset with augmentation options.
 
@@ -57,6 +59,7 @@ class RAFDBWithAugmentation(Dataset):
             rotation_degrees: max rotation in degrees.
             grayscale_prob: probability of grayscale augmentation.
             use_autoaugment: whether to use AutoAugment.
+            aggressive_aug: if True, applies strong augmentation to views > 0.
         """
         self.root = Path(root)
         self.split = split
@@ -65,6 +68,7 @@ class RAFDBWithAugmentation(Dataset):
         self.rotation_degrees = rotation_degrees
         self.grayscale_prob = grayscale_prob
         self.use_autoaugment = use_autoaugment
+        self.aggressive_aug = aggressive_aug
 
         # Load RAFDB dataset (assumes standard RAFDB structure)
         # RAFDB: train/test folders with emotion subfolders
@@ -83,10 +87,17 @@ class RAFDBWithAugmentation(Dataset):
         ])
 
         # Augmentation transforms with variance
-        self.augmentation_transforms = [
-            self._create_augmentation_transform()
-            for _ in range(num_augmentations)
-        ]
+        self.augmentation_transforms = []
+        for i in range(num_augmentations):
+            if self.aggressive_aug:
+                # View 0: Weak, View 1+: Strong
+                strength = "strong" if i > 0 else "weak"
+            else:
+                strength = "default"
+            
+            self.augmentation_transforms.append(
+                self._create_augmentation_transform(strength)
+            )
 
         # Load images and labels using ImageFolder
         self.dataset = datasets.ImageFolder(
@@ -94,8 +105,27 @@ class RAFDBWithAugmentation(Dataset):
             transform=None,  # We'll apply transforms manually
         )
 
-    def _create_augmentation_transform(self):
+    def _create_augmentation_transform(self, strength="default"):
         """Create a single augmentation pipeline with variance."""
+        if strength == "strong":
+            # Aggressive: Wide crop range, AutoAugment, Flip
+            return transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=(0.2, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        elif strength == "weak":
+            # Weak: Standard crop, Flip, no AutoAugment
+            return transforms.Compose([
+                transforms.RandomResizedCrop(224, scale=self.crop_scale),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+
+        # Default behavior (preserves original logic)
         if self.use_autoaugment:
             transforms_list = [
                 transforms.RandomResizedCrop(224, scale=self.crop_scale),
@@ -107,6 +137,7 @@ class RAFDBWithAugmentation(Dataset):
             transforms_list = [
                 transforms.RandomResizedCrop(224, scale=self.crop_scale),
                 transforms.RandomRotation(self.rotation_degrees),
+                transforms.RandomHorizontalFlip(),
             ]
             if self.grayscale_prob > 0:
                 transforms_list.append(transforms.RandomGrayscale(p=self.grayscale_prob))
@@ -174,7 +205,11 @@ def visualize_triplet_mining(
         batch_labels = batch_labels.to(device)
 
         # Get embeddings
-        embeddings = model(batch_images)
+        outputs = model(batch_images)
+        if isinstance(outputs, tuple):
+            embeddings = outputs[0]
+        else:
+            embeddings = outputs
 
         # Mine triplets
         anchor_idx, positive_idx, negative_idx = miner(embeddings, batch_labels)
@@ -398,6 +433,7 @@ def main(args):
         "loss_type": args.loss_type,
         "alpha": args.alpha,
         "use_gating": args.use_gating,
+        "aggressive_aug": args.aggressive_aug,
     }
     if args.use_wandb:
         setup_wandb(config)
@@ -428,7 +464,8 @@ def main(args):
         crop_scale=tuple(args.crop_scale),
         rotation_degrees=args.rotation_degrees,
         grayscale_prob=args.grayscale_prob,
-        use_autoaugment=args.use_autoaugment,    
+        use_autoaugment=args.use_autoaugment,
+        aggressive_aug=args.aggressive_aug,
     )
     train_ds = torch.utils.data.Subset(train_ds_full, train_indices)
 
@@ -598,7 +635,7 @@ def main(args):
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"Loss: {train_loss:.4f} | "
-            f"Recall@1: {val_metrics.get('recall_at_1', 0):.4f}"
+            f"Accuracy: {val_metrics.get('accuracy', 0):.4f}"
         )
 
         # Save best model based on validation accuracy
@@ -610,14 +647,27 @@ def main(args):
 
     # Final evaluation and visualization
     print("Final evaluation and visualization...")
-    embeddings, labels = compute_embeddings_and_predictions(
+    embeddings, logits, labels = compute_embeddings_and_predictions(
         model, val_loader, device=device
     )
 
+    # 1. k-NN Confusion Matrix
     cm = compute_confusion_matrix(embeddings, labels, metric=args.metric)
     visualize_confusion_matrix(
-        cm, output_path=str(output_dir / "confusion_matrix.png")
+        cm, 
+        output_path=str(output_dir / "confusion_matrix_knn.png"),
+        title="Confusion Matrix (k-NN)"
     )
+
+    # 2. Linear Classifier Confusion Matrix
+    if logits is not None:
+        cm_linear = compute_confusion_matrix_from_logits(logits, labels)
+        visualize_confusion_matrix(
+            cm_linear, 
+            output_path=str(output_dir / "confusion_matrix_linear.png"),
+            title="Confusion Matrix (Linear Classifier)"
+        )
+
     visualize_pca(embeddings, labels, output_path=str(output_dir / "pca.png"))
 
     # Final test evaluation
@@ -627,16 +677,10 @@ def main(args):
     test_metrics = final_eval(
         model, test_loader, device=device, metric=args.metric
     )
-    print(f"Test Recall@1: {test_metrics.get('recall_at_1', 0):.4f}")
-    print(f"Test Recall@5: {test_metrics.get('recall_at_5', 0):.4f}")
-    print(f"Test Recall@10: {test_metrics.get('recall_at_10', 0):.4f}")
     print(f"Test Accuracy: {test_metrics.get('accuracy', 0):.4f}")
 
     if args.use_wandb:
         wandb.log({
-            "test_recall_at_1": test_metrics.get("recall_at_1", 0),
-            "test_recall_at_5": test_metrics.get("recall_at_5", 0),
-            "test_recall_at_10": test_metrics.get("recall_at_10", 0),
             "test_accuracy": test_metrics.get("accuracy", 0),
         })
 
@@ -667,6 +711,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_autoaugment", action="store_true", help="Use AutoAugment"
     )
+    parser.add_argument("--aggressive_aug", action="store_true", help="Use aggressive augmentation (Weak+Strong views)")
     parser.add_argument(
         "--crop_scale",
         type=float,

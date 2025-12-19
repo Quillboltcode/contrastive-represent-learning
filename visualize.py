@@ -21,8 +21,8 @@ def compute_embeddings_and_predictions(
     model: nn.Module,
     data_loader: DataLoader,
     device: torch.device = torch.device("cpu"),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute embeddings and labels for all samples.
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Compute embeddings, logits (if available), and labels for all samples.
 
     Args:
         model: embedding model.
@@ -30,12 +30,13 @@ def compute_embeddings_and_predictions(
         device: device to run on.
 
     Returns:
-        (embeddings, labels) as tensors.
+        (embeddings, logits, labels). Logits is None if model doesn't return them.
     """
     model.eval()
     device = torch.device(device) if isinstance(device, str) else device
 
     all_embeddings = []
+    all_logits = []
     all_labels = []
 
     with torch.no_grad():
@@ -51,6 +52,8 @@ def compute_embeddings_and_predictions(
             outputs = model(inputs)
             if isinstance(outputs, tuple):
                 embeddings = outputs[0]
+                logits = outputs[1]
+                all_logits.append(logits.cpu())
             else:
                 embeddings = outputs
             all_embeddings.append(embeddings.cpu())
@@ -58,7 +61,12 @@ def compute_embeddings_and_predictions(
 
     embeddings = torch.cat(all_embeddings, dim=0)
     labels = torch.cat(all_labels, dim=0)
-    return embeddings, labels
+    
+    logits = None
+    if all_logits:
+        logits = torch.cat(all_logits, dim=0)
+        
+    return embeddings, logits, labels
 
 
 def compute_confusion_matrix(
@@ -96,6 +104,23 @@ def compute_confusion_matrix(
     predicted_labels = labels[nearest_indices]
 
     # Compute confusion matrix
+    num_classes = len(torch.unique(labels))
+    cm = confusion_matrix(
+        labels.numpy(), predicted_labels.numpy(), labels=list(range(num_classes))
+    )
+
+    return cm
+
+
+def compute_confusion_matrix_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> np.ndarray:
+    """Compute confusion matrix from logits (Linear Classifier)."""
+    predicted_labels = torch.argmax(logits, dim=1)
+    
+    # Compute confusion matrix
+    # Note: Assuming labels are 0 to num_classes-1
     num_classes = len(torch.unique(labels))
     cm = confusion_matrix(
         labels.numpy(), predicted_labels.numpy(), labels=list(range(num_classes))
@@ -207,6 +232,7 @@ def visualize_confusion_matrix(
     cm: np.ndarray,
     output_path: str | None = None,
     figsize: tuple[int, int] = (10, 8),
+    title: str = "Confusion Matrix (Nearest Neighbor Classification)",
 ) -> None:
     """Visualize confusion matrix as heatmap.
 
@@ -214,13 +240,14 @@ def visualize_confusion_matrix(
         cm: confusion matrix of shape (num_classes, num_classes).
         output_path: optional path to save the figure.
         figsize: figure size (width, height).
+        title: title of the plot.
     """
     fig, ax = plt.subplots(figsize=figsize)
 
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax, cbar=True)
     ax.set_xlabel("Predicted Label")
     ax.set_ylabel("True Label")
-    ax.set_title("Confusion Matrix (Nearest Neighbor Classification)")
+    ax.set_title(title)
 
     if output_path is not None:
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
