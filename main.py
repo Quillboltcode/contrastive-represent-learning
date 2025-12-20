@@ -176,6 +176,7 @@ def visualize_triplet_mining(
     miner,
     device: torch.device,
     num_samples: int = 3,
+    output_dir: Optional[str] = None,
 ):
     """Visualize triplet mining results to verify anchor/positive/negative selection.
 
@@ -185,6 +186,7 @@ def visualize_triplet_mining(
         miner: TripletMarginMiner instance.
         device: device to run on.
         num_samples: number of triplets to visualize.
+        output_dir: directory to save visualizations.
     """
     try:
         import matplotlib.pyplot as plt
@@ -285,6 +287,13 @@ def visualize_triplet_mining(
                 fontweight="bold",
             )
             plt.tight_layout()
+
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                save_path = os.path.join(output_dir, f"triplet_vis_{triplet_num}.png")
+                plt.savefig(save_path)
+                print(f"  Saved triplet visualization to {save_path}")
+
             plt.show()
 
             print(
@@ -590,7 +599,9 @@ def main(args):
 
     # This visualization is for triplets, so we'll skip it for SupCon
     if miner is not None:
-        visualize_triplet_mining(model, train_loader, miner, device)
+        visualize_triplet_mining(
+            model, train_loader, miner, device, output_dir=str(output_dir)
+        )
     else:
         print("\n" + "=" * 70)
         print("STEP 3A: Skipping triplet visualization (using SupConLoss)...")
