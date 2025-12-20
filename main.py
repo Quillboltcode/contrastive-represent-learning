@@ -581,9 +581,12 @@ def main(args):
         miner = TripletMarginMiner(margin=args.margin, type_of_triplets="semihard")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.StepLR(
-        optimizer, step_size=args.lr_step, gamma=0.1
-    )
+    if args.scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
+    else:
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=args.lr_step, gamma=0.1
+        )
 
     # This visualization is for triplets, so we'll skip it for SupCon
     if miner is not None:
@@ -735,6 +738,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=28, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lr_step", type=int, default=10, help="LR scheduler step")
+    parser.add_argument("--scheduler", type=str, default="step", choices=["step", "cosine"], help="LR scheduler type")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers")
 
     # Model args
