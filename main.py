@@ -422,6 +422,9 @@ def main(args):
         "learning_rate": args.lr,
         "batch_size": args.batch_size,
         "num_epochs": args.num_epochs,
+        "model_name": args.model_name,
+        "pretrained": args.pretrained,
+        "normalize": args.normalize,
         "embedding_dim": args.embedding_dim,
         "temperature": args.temperature,
         "metric": args.metric,
@@ -548,18 +551,18 @@ def main(args):
     print("=" * 70)
     
     model = EmbeddingModel(
-        model_name="resnet50",
+        model_name=args.model_name,
         embedding_dim=args.embedding_dim,
-        pretrained=True,
-        normalize=True,
+        pretrained=args.pretrained,
+        normalize=args.normalize,
         num_classes=num_classes,  # Enable classifier head
         use_gating=args.use_gating,
     )
     model.to(device)
     print("✓ Model initialized:")
-    print("  - Backbone: ResNet50 (pretrained)")
+    print(f"  - Backbone: {args.model_name} (pretrained={args.pretrained})")
     print(f"  - Embedding dim: {args.embedding_dim}")
-    print("  - Normalization: Enabled (L2)")
+    print(f"  - Normalization: {args.normalize}")
     print(f"  - One-Stage Learning: True (alpha={args.alpha})")
     print(f"  - Device: {device}")
     print(f"  - Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -635,7 +638,7 @@ def main(args):
         print(
             f"Epoch {epoch + 1}/{args.num_epochs} | "
             f"Loss: {train_loss:.4f} | "
-            f"Accuracy: {val_metrics.get('accuracy', 0):.4f}"
+            f"Val Accuracy: {val_metrics.get('accuracy', 0):.4f}"
         )
 
         # Save best model based on validation accuracy
@@ -736,7 +739,16 @@ if __name__ == "__main__":
 
     # Model args
     parser.add_argument(
+        "--model_name", type=str, default="resnet50", help="Backbone model name"
+    )
+    parser.add_argument(
         "--embedding_dim", type=int, default=128, help="Embedding dimension"
+    )
+    parser.add_argument(
+        "--pretrained", action="store_true", help="Use pretrained weights"
+    )
+    parser.add_argument(
+        "--normalize", action="store_true", help="Normalize embeddings"
     )
 
     # Metric learning args
