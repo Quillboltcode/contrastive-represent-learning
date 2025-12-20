@@ -4,6 +4,7 @@ import os
 import argparse
 from pathlib import Path
 from typing import Optional
+import copy
 
 import torch
 import torch.nn as nn
@@ -18,7 +19,6 @@ from pytorch_metric_learning.miners import TripletMarginMiner
 from pytorch_metric_learning.samplers import MPerClassSampler
 
 from dataset import train_val_split
-from train import train_one_epoch, train_classifier_one_epoch
 from evalute import evaluate_one_epoch, final_eval
 from visualize import (
     compute_embeddings_and_predictions,
@@ -28,7 +28,7 @@ from visualize import (
     visualize_confusion_matrix,
     visualize_pca,
 )
-from model import EmbeddingModel, LinearClassifier, validate_model_and_augmentation
+from model import EmbeddingModel
 
 
 class RAFDBWithAugmentation(Dataset):
@@ -406,7 +406,7 @@ def setup_wandb(config: dict):
     )
 
 
-def main(args):
+def run_experiment(args, initialize_wandb=True):
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -446,8 +446,10 @@ def main(args):
         "alpha": args.alpha,
         "use_gating": args.use_gating,
         "aggressive_aug": args.aggressive_aug,
+        "optimizer": args.optimizer,
+        "weight_decay": args.weight_decay,
     }
-    if args.use_wandb:
+    if args.use_wandb and initialize_wandb:
         setup_wandb(config)
 
     # Load RAFDB dataset
@@ -589,7 +591,13 @@ def main(args):
         print("  - Miner: TripletMarginMiner")
         miner = TripletMarginMiner(margin=args.margin, type_of_triplets="semihard")
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.optimizer.lower() == "sgd":
+        print(f"  - Optimizer: SGD (lr={args.lr}, momentum=0.9, weight_decay={args.weight_decay})")
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    else:
+        print(f"  - Optimizer: Adam (lr={args.lr}, weight_decay={args.weight_decay})")
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
     if args.scheduler == "cosine":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     else:
@@ -644,6 +652,7 @@ def main(args):
                 "train_loss": train_loss,
                 "train_loss_metric": train_results["metric"],
                 "train_loss_ce": train_results["ce"],
+                "val_accuracy": val_metrics.get("accuracy", 0),
             }
             log_dict.update(val_metrics)
             log_dict["learning_rate"] = scheduler.get_last_lr()[0]
@@ -707,6 +716,43 @@ def main(args):
     print(f"Training complete. Results saved to {output_dir}")
 
 
+def main(args):
+    if args.sweep:
+        sweep_config = {
+            'method': 'bayes',
+            'metric': {'name': 'val_accuracy', 'goal': 'maximize'},
+            'parameters': {
+                # High impact on your PCA "Rays"
+                'temperature': {'values': [0.07, 0.1, 0.2]},
+                'alpha': {'distribution': 'uniform', 'min': 0.1, 'max': 0.5},
+                
+                # High impact on Gating stability
+                'learning_rate': {'distribution': 'log_uniform', 'min': -9, 'max': -5},
+                'weight_decay': {'values': [1e-4, 1e-2]},
+                
+                # Architecture toggle
+                'use_gating': {'values': [True, False]},
+                'optimizer': {'values': ['adam', 'sgd']}
+            }
+        }
+        
+        def train_fn():
+            wandb.init()
+            run_args = copy.deepcopy(args)
+            run_args.use_wandb = True
+            for k, v in wandb.config.items():
+                if k == 'learning_rate':
+                    run_args.lr = v
+                elif hasattr(run_args, k):
+                    setattr(run_args, k, v)
+            run_experiment(run_args, initialize_wandb=False)
+
+        sweep_id = wandb.sweep(sweep_config, project="contrast-represent-learning")
+        wandb.agent(sweep_id, function=train_fn, count=5)
+    else:
+        run_experiment(args)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train metric learning model on RAFDB with wandb logging."
@@ -745,11 +791,12 @@ if __name__ == "__main__":
 
     # Training args
     parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--num_epochs_classifier", type=int, default=20, help="Number of epochs for linear classifier")
     parser.add_argument("--batch_size", type=int, default=28, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--lr_step", type=int, default=10, help="LR scheduler step")
     parser.add_argument("--scheduler", type=str, default="step", choices=["step", "cosine"], help="LR scheduler type")
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "sgd"], help="Optimizer type")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers")
 
     # Model args
@@ -785,6 +832,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.5, help="Weight for metric loss (1-alpha for CE)")
     parser.add_argument("--use_gating", action="store_true", help="Use gating mechanism in model")
 
+    parser.add_argument("--sweep", action="store_true", help="Run wandb sweep")
 
     # Logging/output args
     parser.add_argument(
