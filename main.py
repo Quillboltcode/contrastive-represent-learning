@@ -78,7 +78,8 @@ class RAFDBWithAugmentation(Dataset):
 
         # Base transform: resize to 224x224
         self.base_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -177,6 +178,7 @@ def visualize_triplet_mining(
     device: torch.device,
     num_samples: int = 3,
     output_dir: Optional[str] = None,
+    num_augmentations: int = 2,
 ):
     """Visualize triplet mining results to verify anchor/positive/negative selection.
 
@@ -187,6 +189,7 @@ def visualize_triplet_mining(
         device: device to run on.
         num_samples: number of triplets to visualize.
         output_dir: directory to save visualizations.
+        num_augmentations: number of views per sample, for context.
     """
     try:
         import matplotlib.pyplot as plt
@@ -239,6 +242,16 @@ def visualize_triplet_mining(
             p_img = batch_images[p_idx]
             n_img = batch_images[n_idx]
 
+            # Sanity check: are the image tensors identical?
+            tensor_dist = torch.dist(a_img, p_img).item()
+            print(f"\n  Triplet {triplet_num + 1}: a_idx={a_idx}, p_idx={p_idx}, n_idx={n_idx}")
+            print(f"    Distance between anchor and positive image tensors: {tensor_dist:.4f}")
+            if a_idx == p_idx:
+                print("    !!! Anchor and Positive have the same index. This is a bug in the miner.")
+            if tensor_dist < 1e-6:
+                print("    !!! Anchor and Positive images are identical. This suggests an issue with data augmentation.")
+
+
             # Denormalize images (undo ImageNet normalization)
             mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
             std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
@@ -260,9 +273,12 @@ def visualize_triplet_mining(
             # Positive (same class as anchor)
             ax_p = fig.add_subplot(gs[0, 1])
             ax_p.imshow(p_img_vis)
+            
+            is_same_source = (a_idx // num_augmentations == p_idx // num_augmentations)
+            source_info = "Same Source" if is_same_source else "Different Source"
             status = "✓ Same" if p_label == a_label else "✗ Wrong"
             ax_p.set_title(
-                f"Positive\nLabel: {p_label}\n{status}",
+                f"Positive ({source_info})\nLabel: {p_label}\n{status}",
                 fontsize=12,
                 fontweight="bold",
                 color="green" if p_label == a_label else "red",
@@ -295,12 +311,6 @@ def visualize_triplet_mining(
                 print(f"  Saved triplet visualization to {save_path}")
 
             plt.show()
-
-            print(
-                f"  Triplet {triplet_num + 1}: "
-                f"Anchor(L={a_label}) -> Pos(L={p_label}) + Neg(L={n_label}) | "
-                f"Valid: {p_label == a_label and n_label != a_label}"
-            )
 
     print("=" * 70)
 
@@ -486,7 +496,7 @@ def run_experiment(args, initialize_wandb=True):
     # Create the actual Val dataset (clean, single view)
     # We use split='train' to point to the folder, but num_augmentations=1 for single view
     val_ds_full = RAFDBWithAugmentation(
-        root=args.rafdb_root, split="train", num_augmentations=1
+        root=args.rafdb_root, split="train", num_augmentations=0
     )
     val_ds = torch.utils.data.Subset(val_ds_full, val_indices)
 
@@ -541,7 +551,7 @@ def run_experiment(args, initialize_wandb=True):
     test_dataset = RAFDBWithAugmentation(
         root=args.rafdb_root,
         split="test",
-        num_augmentations=args.num_augmentations,
+        num_augmentations=0,
         crop_scale=tuple(args.crop_scale),
         rotation_degrees=args.rotation_degrees,
         grayscale_prob=args.grayscale_prob,
@@ -608,7 +618,12 @@ def run_experiment(args, initialize_wandb=True):
     # This visualization is for triplets, so we'll skip it for SupCon
     if miner is not None:
         visualize_triplet_mining(
-            model, train_loader, miner, device, output_dir=str(output_dir)
+            model,
+            train_loader,
+            miner,
+            device,
+            output_dir=str(output_dir),
+            num_augmentations=args.num_augmentations,
         )
     else:
         print("\n" + "=" * 70)
