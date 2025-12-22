@@ -725,6 +725,29 @@ def run_experiment(args, initialize_wandb=True):
             "test_accuracy": test_metrics.get("accuracy", 0),
         })
 
+    # Test set visualization
+    print("Visualizing test set results...")
+    test_embeddings, test_logits, test_labels = compute_embeddings_and_predictions(
+        model, test_loader, device=device
+    )
+
+    cm_test = compute_confusion_matrix(test_embeddings, test_labels, metric=args.metric)
+    visualize_confusion_matrix(
+        cm_test,
+        output_path=str(output_dir / "test_confusion_matrix_knn.png"),
+        title="Test Confusion Matrix (k-NN)"
+    )
+
+    if test_logits is not None:
+        cm_linear_test = compute_confusion_matrix_from_logits(test_logits, test_labels)
+        visualize_confusion_matrix(
+            cm_linear_test,
+            output_path=str(output_dir / "test_confusion_matrix_linear.png"),
+            title="Test Confusion Matrix (Linear Classifier)"
+        )
+
+    visualize_pca(test_embeddings, test_labels, output_path=str(output_dir / "test_pca.png"))
+
     if args.use_wandb:
         wandb.finish()
 
