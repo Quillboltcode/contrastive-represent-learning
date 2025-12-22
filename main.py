@@ -156,7 +156,7 @@ class RAFDBWithAugmentation(Dataset):
         # Get original image and label
         img, label = self.dataset[idx]
         
-        if self.split == 'train' or self.num_augmentations > 0:
+        if self.num_augmentations > 0:
             # For training, create multiple augmented views for contrastive learning
             img_augmented = [
                 aug_transform(img) for aug_transform in self.augmentation_transforms
@@ -830,7 +830,7 @@ if __name__ == "__main__":
 
     # Metric learning args
     parser.add_argument("--temperature", type=float, default=0.1, help="SupCon temperature")
-    parser.add_argument("--margin", type=float, default=0.2, help="Triplet margin")
+    parser.add_argument("--margin", type=float, default=0.3, help="Triplet margin")
     parser.add_argument(
         "--metric",
         type=str,
