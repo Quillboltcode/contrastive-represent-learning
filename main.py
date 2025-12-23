@@ -225,13 +225,21 @@ def visualize_triplet_mining(
 
         print(f"✓ Mined {anchor_idx.numel()} triplets from batch of {batch_images.shape[0]} images")
 
-        # Visualize first num_samples triplets
-        num_to_show = min(num_samples, anchor_idx.numel())
+        # Visualize first num_samples triplets that are different-source
+        shown_count = 0
+        print(f"Filtering for different-source triplets (Anchor != Positive Source)...")
 
-        for triplet_num in range(num_to_show):
-            a_idx = anchor_idx[triplet_num].item()
-            p_idx = positive_idx[triplet_num].item()
-            n_idx = negative_idx[triplet_num].item()
+        for triplet_idx in range(anchor_idx.numel()):
+            if shown_count >= num_samples:
+                break
+
+            a_idx = anchor_idx[triplet_idx].item()
+            p_idx = positive_idx[triplet_idx].item()
+            n_idx = negative_idx[triplet_idx].item()
+
+            # Filter same source
+            if num_augmentations > 0 and (a_idx // num_augmentations == p_idx // num_augmentations):
+                continue
 
             a_label = batch_labels[a_idx].item()
             p_label = batch_labels[p_idx].item()
@@ -244,7 +252,7 @@ def visualize_triplet_mining(
 
             # Sanity check: are the image tensors identical?
             tensor_dist = torch.dist(a_img, p_img).item()
-            print(f"\n  Triplet {triplet_num + 1}: a_idx={a_idx}, p_idx={p_idx}, n_idx={n_idx}")
+            print(f"\n  Triplet {shown_count + 1}: a_idx={a_idx}, p_idx={p_idx}, n_idx={n_idx}")
             print(f"    Distance between anchor and positive image tensors: {tensor_dist:.4f}")
             if a_idx == p_idx:
                 print("    !!! Anchor and Positive have the same index. This is a bug in the miner.")
@@ -298,7 +306,7 @@ def visualize_triplet_mining(
             ax_n.axis("off")
 
             fig.suptitle(
-                f"Triplet {triplet_num + 1}/{num_to_show}",
+                f"Triplet {shown_count + 1} (Different Source)",
                 fontsize=14,
                 fontweight="bold",
             )
@@ -306,11 +314,13 @@ def visualize_triplet_mining(
 
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-                save_path = os.path.join(output_dir, f"triplet_vis_{triplet_num}.png")
+                save_path = os.path.join(output_dir, f"triplet_vis_{shown_count}.png")
                 plt.savefig(save_path)
                 print(f"  Saved triplet visualization to {save_path}")
 
             plt.show()
+            
+            shown_count += 1
 
     print("=" * 70)
 
@@ -326,6 +336,7 @@ def train_combined_epoch(
     miner=None,
     epoch: int = 0,
     log_interval: int = 10,
+    num_augmentations: int = 1,
 ) -> dict:
     """Train one epoch with combined Metric and Cross-Entropy loss."""
     model.train()
@@ -345,6 +356,19 @@ def train_combined_epoch(
         # 1. Metric Learning Loss
         if miner is not None:
             indices_tuple = miner(embeddings, labels)
+
+            # Filter out same-source pairs (anchor and positive are different views of the same image)
+            if num_augmentations > 1:
+                a, p, n = indices_tuple
+                # Calculate source index: idx // num_augmentations
+                # This assumes the batch is ordered as [img1_v1, img1_v2, img2_v1, ...]
+                source_a = a // num_augmentations
+                source_p = p // num_augmentations
+
+                # Keep only triplets where anchor and positive are from different sources
+                mask = source_a != source_p
+                indices_tuple = (a[mask], p[mask], n[mask])
+
             loss_metric = loss_metric_fn(embeddings, labels, indices_tuple)
         else:
             loss_metric = loss_metric_fn(embeddings, labels)
@@ -623,7 +647,7 @@ def run_experiment(args, initialize_wandb=True):
             miner,
             device,
             output_dir=str(output_dir),
-            num_augmentations=args.num_augmentations,
+            num_augmentations=max(1, args.num_augmentations),
         )
     else:
         print("\n" + "=" * 70)
@@ -648,6 +672,7 @@ def run_experiment(args, initialize_wandb=True):
             device=device,
             miner=miner,
             epoch=epoch,
+            num_augmentations=max(1, args.num_augmentations),
         )
         train_loss = train_results["total"]
 
